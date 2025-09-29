@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Gofile API token helper
+api.txt
+cleancode.me

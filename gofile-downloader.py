@@ -1,12 +1,21 @@
 #! /usr/bin/env python3
 
 
-from os import getcwd, getenv, listdir, makedirs, name, path, rmdir, name
+import argparse
+import json
+from os import getcwd, getenv, listdir, makedirs, name, path, rmdir
+from pathlib import Path
 from sys import argv, exit, stdout, stderr
-from typing import Any, Iterator, NoReturn, TextIO
+from typing import Any, Dict, Iterator, List, NoReturn, Optional, TextIO
 from types import FrameType
+from urllib.parse import parse_qs, urlparse
 from itertools import count
-from requests import Session, Response, Timeout
+from requests import Session, Response, Timeout, RequestException
+try:
+    from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
+except Exception:
+    MultipartEncoder = None
+    MultipartEncoderMonitor = None
 from requests.structures import CaseInsensitiveDict
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -14,9 +23,12 @@ from hashlib import sha256
 from shutil import move
 from signal import signal, SIGINT, SIG_IGN
 from time import perf_counter
+from math import ceil
 
 
 NEW_LINE: str = "\n" if name != "nt" else "\r\n"
+API_BASE: str = "https://api.gofile.io"
+TOKEN_FILENAME: str = "api.txt"
 
 
 def has_ansi_support() -> bool:
@@ -63,6 +75,41 @@ def _print(msg: str, error: bool = False) -> None:
     output.flush()
 
 
+def _print_progress(prefix: str, transferred: int, total: Optional[int], start_time: float) -> None:
+    """Print a single-line progress indicator with rate and percentage.
+
+    This uses carriage return to update the same terminal line.
+    """
+
+    elapsed = perf_counter() - start_time
+    rate = transferred / elapsed if elapsed > 0 else 0.0
+
+    if total and total > 0:
+        percent = transferred / total * 100
+        eta = (total - transferred) / rate if rate > 0 else None
+        eta_text = f" ETA {ceil(eta)}s" if eta is not None else ""
+        size_text = f"{transferred}/{total} bytes"
+        progress_text = f"{percent:5.1f}%"
+    else:
+        size_text = f"{transferred} bytes"
+        progress_text = "   -  "
+        eta_text = ""
+
+    unit = "B/s"
+    display_rate = rate
+    if rate >= 1024 ** 3:
+        display_rate = rate / (1024 ** 3)
+        unit = "GB/s"
+    elif rate >= 1024 ** 2:
+        display_rate = rate / (1024 ** 2)
+        unit = "MB/s"
+    elif rate >= 1024:
+        display_rate = rate / 1024
+        unit = "KB/s"
+
+    _print(f"\r{prefix} | {progress_text} | {size_text} | {display_rate:.1f}{unit}{eta_text}")
+
+
 def die(msg: str) -> NoReturn:
     """
     die
@@ -75,6 +122,319 @@ def die(msg: str) -> NoReturn:
 
     _print(f"{msg}{NEW_LINE}", True)
     exit(-1)
+
+
+class GofileError(RuntimeError):
+    """Raised when gofile.io responds with an error."""
+
+
+class GofileClient:
+    """Minimal client to interact with gofile.io's public API."""
+
+    _DEFAULT_HEADERS: CaseInsensitiveDict[str] = CaseInsensitiveDict(
+        {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "User-Agent": "gofile-downloader/2.x",
+        }
+    )
+
+    def __init__(self, token: Optional[str] = None) -> None:
+        self.session: Session = Session()
+        self.session.headers.update(self._DEFAULT_HEADERS)
+        self.token: Optional[str] = token or getenv("GOFILE_TOKEN") or load_token_from_file()
+        self._attach_token(self.token)
+
+    def _attach_token(self, token: Optional[str]) -> None:
+        if not token:
+            return
+        # Public API accepts the token either via cookie or Bearer header.
+        self.session.cookies.set("accountToken", token)
+        self.session.headers.update({"Authorization": f"Bearer {token}"})
+
+    def _ensure_ok(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if payload.get("status") != "ok":
+            raise GofileError(payload.get("status", "error"))
+        return payload["data"]
+
+    def get_server(self) -> str:
+        # Note: getServer endpoint may be unavailable; fallback to known server
+        try:
+            response = self.session.get(f"{API_BASE}/getServer", timeout=30)
+            response.raise_for_status()
+            data = self._ensure_ok(response.json())
+            return data["server"]
+        except Exception:
+            # Fallback to a known working server
+            return "store1"
+
+    def upload(
+        self,
+        file_path: Path,
+        folder_id: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        server = self.get_server()
+        url = f"https://{server}.gofile.io/uploadFile"
+        payload: Dict[str, Any] = {}
+        if self.token:
+            payload["token"] = self.token
+        if folder_id:
+            payload["folderId"] = folder_id
+        if description:
+            payload["description"] = description
+
+        # Prefer requests-toolbelt MultipartEncoderMonitor for progress-aware multipart upload
+        if MultipartEncoder and MultipartEncoderMonitor:
+            fields = {"file": (file_path.name, file_path.open("rb"), "application/octet-stream")}
+            for k, v in payload.items():
+                fields[k] = str(v)
+
+            encoder = MultipartEncoder(fields=fields)
+            start = perf_counter()
+
+            def _callback(monitor) -> None:
+                _print_progress(f"Uploading {file_path.name}", monitor.bytes_read, encoder.len, start)
+
+            monitor = MultipartEncoderMonitor(encoder, _callback)
+            headers = {"Content-Type": monitor.content_type}
+            response = self.session.post(url, data=monitor, headers=headers, timeout=120)
+            _print("\n")
+            response.raise_for_status()
+            return self._ensure_ok(response.json())
+
+        # Fallback: simple upload without multipart progress
+        with file_path.open("rb") as fh:
+            response = self.session.post(url, files={"file": (file_path.name, fh)}, data=payload, timeout=120)
+        response.raise_for_status()
+        return self._ensure_ok(response.json())
+
+    def get_content(self, content_id: str, password: Optional[str] = None) -> Dict[str, Any]:
+        url = f"{API_BASE}/contents/{content_id}"
+        params: Dict[str, Any] = {
+            "wt": "4fd6sg89d7s6",
+            "cache": "true",
+            "sortField": "createTime",
+            "sortDirection": "1",
+        }
+        if password:
+            params["password"] = password
+        response = self.session.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") != "ok":
+            raise GofileError(data.get("status", "error"))
+        return data["data"]
+
+    @staticmethod
+    def _extract_child_id(entry: Dict[str, Any]) -> Optional[str]:
+        for key in ("id", "contentId", "folderId"):
+            value = entry.get(key)
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _build_file_descriptor(
+        entry: Dict[str, Any], parent_id: str
+    ) -> Optional[Dict[str, Any]]:
+        direct_link = entry.get("link") or entry.get("linkDirect")
+        if not direct_link:
+            return None
+
+        file_id = entry.get("fileId") or entry.get("id")
+        name = entry.get("name") or entry.get("fileName") or entry.get("displayName")
+        return {
+            "fileId": file_id,
+            "name": name,
+            "size": entry.get("size"),
+            "directLink": direct_link,
+            "parentContentId": parent_id,
+        }
+
+    def _file_entries_for_node(
+        self, node: Dict[str, Any], parent_id: str
+    ) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+
+        if node.get("type") == "file":
+            descriptor = self._build_file_descriptor(node, parent_id)
+            if descriptor:
+                entries.append(descriptor)
+
+        for child in node.get("children", {}).values():
+            if child.get("type") != "file":
+                continue
+            descriptor = self._build_file_descriptor(child, parent_id)
+            if descriptor:
+                entries.append(descriptor)
+
+        return entries
+
+    def resolve_direct_links(
+        self,
+        content_id: str,
+        password: Optional[str] = None,
+        recursive: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return a list of direct file links for the given content id."""
+
+        results: List[Dict[str, Any]] = []
+        visited: set[str] = set()
+
+        stack: List[str] = [content_id]
+
+        while stack:
+            current_id = stack.pop()
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+
+            node = self.get_content(content_id=current_id, password=password)
+            results.extend(self._file_entries_for_node(node, current_id))
+
+            if not recursive or node.get("type") != "folder":
+                continue
+
+            for child in node.get("children", {}).values():
+                if child.get("type") != "folder":
+                    continue
+                child_id = self._extract_child_id(child)
+                if child_id and child_id not in visited:
+                    stack.append(child_id)
+
+        if not results:
+            raise GofileError("No file entries found in content")
+        return results
+
+    def download(
+        self,
+        content_id: str,
+        destination: Path,
+        file_id: Optional[str] = None,
+        password: Optional[str] = None,
+        overwrite: bool = False,
+    ) -> Path:
+        payload = self.get_content(content_id=content_id, password=password)
+        parent_reference = payload.get("id") or content_id
+
+        files = self._file_entries_for_node(payload, parent_reference)
+        if not files:
+            raise GofileError("No files found in requested content")
+
+        selected: Optional[Dict[str, Any]] = None
+
+        if file_id:
+            for entry in files:
+                if entry.get("fileId") == file_id:
+                    selected = entry
+                    break
+            if not selected:
+                raise GofileError(f"File id '{file_id}' not found in content")
+        else:
+            if len(files) > 1:
+                raise GofileError(
+                    "Multiple files available; provide --file-id to pick one"
+                )
+            selected = files[0]
+
+        if not selected:
+            raise GofileError("Unable to determine download target")
+
+        direct_link = selected.get("directLink")
+        if not direct_link:
+            raise GofileError("Direct download link missing in response")
+
+        filename = selected.get("name") or selected.get("fileId") or f"{content_id}.bin"
+
+        if destination.is_dir():
+            target = destination / filename
+        else:
+            target = destination
+
+        if target.exists() and not overwrite:
+            raise FileExistsError(f"Destination '{target}' already exists")
+
+        with self.session.get(direct_link, stream=True, timeout=120) as response:
+            response.raise_for_status()
+            total_size = None
+            try:
+                total_size = int(response.headers.get("Content-Length") or 0) or None
+            except (TypeError, ValueError):
+                total_size = None
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            transferred = 0
+            start = perf_counter()
+            with target.open("wb") as fh:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+                        transferred += len(chunk)
+                        _print_progress(f"Downloading {filename}", transferred, total_size, start)
+            # newline after finished
+            _print("\n")
+        return target
+
+
+def extract_content_id(value: str) -> str:
+    """Return the content id/code extracted from a possible gofile link."""
+
+    if not value:
+        raise ValueError("Empty gofile link or code provided")
+
+    parsed = urlparse(value)
+    if not parsed.scheme:
+        return value
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if path_parts:
+        if path_parts[0].lower() == "d" and len(path_parts) >= 2:
+            return path_parts[1]
+        if path_parts[-1]:
+            return path_parts[-1]
+
+    query = parse_qs(parsed.query)
+    for key in ("c", "contentId", "contentid", "id"):
+        values = query.get(key)
+        if values:
+            return values[0]
+
+    raise ValueError("Unable to determine content id from link")
+
+
+def load_token_from_file() -> Optional[str]:
+    """Attempt to load an API token from an `api.txt` file."""
+
+    seen: set[Path] = set()
+    candidates: List[Path] = []
+
+    try:
+        module_dir = Path(__file__).resolve().parent
+        candidates.append(module_dir / TOKEN_FILENAME)
+    except (NameError, OSError):
+        pass
+
+    candidates.append(Path.cwd() / TOKEN_FILENAME)
+
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            content = candidate.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+        for line in content.splitlines():
+            token = line.strip()
+            if token:
+                return token
+    return None
 
 
 class Downloader:
@@ -879,26 +1239,193 @@ class Manager:
             signal(SIGINT, SIG_IGN)
 
 
-if __name__ == "__main__":
-    url_or_file: str | None = None
-    password: str | None = None
-    argc: int = len(argv)
+def parse_cli_args(args: Optional[List[str]] = None) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
+    parser = argparse.ArgumentParser(
+        description="Download, upload, and resolve gofile.io content.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--token",
+        help="Gofile API token (falls back to GOFILE_TOKEN env var or api.txt file)",
+    )
 
-    if argc > 1:
-        url_or_file = argv[1]
+    subparsers = parser.add_subparsers(dest="command")
 
-        if argc > 2:
-            password = argv[2]
+    mirror_parser = subparsers.add_parser(
+        "mirror",
+        help="Use the advanced multi-threaded downloader (legacy behaviour)",
+    )
+    mirror_parser.add_argument(
+        "source",
+        help="Gofile folder/content link or path to a text file with links",
+    )
+    mirror_parser.add_argument(
+        "--password",
+        help="Password for locked content (overrides per-line passwords in files)",
+    )
 
-        manager: Manager = Manager(url_or_file=url_or_file, password=password)
+    upload_parser = subparsers.add_parser("upload", help="Upload a file to gofile.io")
+    upload_parser.add_argument("file", type=Path, help="Path to the file to upload")
+    upload_parser.add_argument(
+        "--folder-id",
+        dest="folder_id",
+        help="Optional folder id to upload into",
+    )
+    upload_parser.add_argument(
+        "--description",
+        help="Optional description to attach to the file",
+    )
 
-        # Run
-        manager.run()
-    else:
-        die(f"Usage:"
-            f"{NEW_LINE}"
-            f"python gofile-downloader.py https://gofile.io/d/contentid"
-            f"{NEW_LINE}"
-            f"python gofile-downloader.py https://gofile.io/d/contentid password"
+    download_parser = subparsers.add_parser(
+        "download", help="Download a single file (non-recursive)"
+    )
+    download_parser.add_argument(
+        "source",
+        help="Gofile content code or share link",
+    )
+    download_parser.add_argument(
+        "--file-id",
+        help="Specific file id inside the content (if multiple files exist)",
+    )
+    download_parser.add_argument(
+        "--dest",
+        type=Path,
+        default=Path.cwd(),
+        help="Destination file or directory",
+    )
+    download_parser.add_argument(
+        "--password",
+        help="Password for locked content, if required",
+    )
+    download_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite destination file if it already exists",
+    )
+
+    resolve_parser = subparsers.add_parser(
+        "resolve", help="Resolve a gofile folder link or code to direct file links"
+    )
+    resolve_parser.add_argument(
+        "source",
+        help="Gofile folder/content link or code",
+    )
+    resolve_parser.add_argument(
+        "--password",
+        help="Password for locked content, if required",
+    )
+    resolve_parser.add_argument(
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        help="Do not traverse nested folders",
+    )
+    resolve_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output results as JSON",
+    )
+    resolve_parser.set_defaults(recursive=True)
+
+    return parser, parser.parse_args(args)
+
+
+def _legacy_entry(args: List[str]) -> int:
+    if not args:
+        die(
+            "Usage:\n"
+            "python gofile-downloader.py https://gofile.io/d/contentid\n"
+            "python gofile-downloader.py https://gofile.io/d/contentid password"
         )
+
+    url_or_file: str = args[0]
+    password: Optional[str] = args[1] if len(args) > 1 else None
+    manager = Manager(url_or_file=url_or_file, password=password)
+    manager.run()
+    return 0
+
+
+def main(argv_: Optional[List[str]] = None) -> int:
+    if argv_ is None:
+        argv_ = argv[1:]
+
+    commands = {"upload", "download", "resolve", "mirror"}
+
+    if argv_ and not argv_[0].startswith("-") and argv_[0] not in commands:
+        return _legacy_entry(argv_)
+
+    parser, args = parse_cli_args(argv_)
+
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 1
+
+    if args.command == "mirror":
+        manager = Manager(url_or_file=args.source, password=args.password)
+        manager.run()
+        return 0
+
+    client = GofileClient(token=args.token)
+
+    try:
+        if args.command == "upload":
+            data = client.upload(
+                file_path=args.file,
+                folder_id=args.folder_id,
+                description=args.description,
+            )
+            _print("Upload complete:" + NEW_LINE)
+            _print(f"  File ID: {data.get('fileId')}{NEW_LINE}")
+            _print(f"  Code: {data.get('code')}{NEW_LINE}")
+            _print(f"  Download page: {data.get('downloadPage')}{NEW_LINE}")
+            if "directLink" in data:
+                _print(f"  Direct link: {data['directLink']}{NEW_LINE}")
+            return 0
+
+        if args.command == "download":
+            content_id = extract_content_id(args.source)
+            destination = client.download(
+                content_id=content_id,
+                destination=args.dest,
+                file_id=args.file_id,
+                password=args.password,
+                overwrite=args.overwrite,
+            )
+            _print(f"Downloaded to {destination}{NEW_LINE}")
+            return 0
+
+        if args.command == "resolve":
+            content_id = extract_content_id(args.source)
+            entries = client.resolve_direct_links(
+                content_id=content_id,
+                password=args.password,
+                recursive=args.recursive,
+            )
+            if args.json:
+                _print(json.dumps(entries, indent=2) + NEW_LINE)
+            else:
+                _print(f"Resolved {len(entries)} file(s):{NEW_LINE}")
+                for entry in entries:
+                    size = entry.get("size")
+                    size_text = f" ({size} bytes)" if size is not None else ""
+                    name = entry.get("name") or entry.get("fileId")
+                    _print(f"- {name}{size_text}: {entry['directLink']}{NEW_LINE}")
+            return 0
+
+    except FileExistsError as exc:
+        _print(f"{exc}{NEW_LINE}", True)
+        return 1
+    except ValueError as exc:
+        _print(f"Error: {exc}{NEW_LINE}", True)
+        return 1
+    except (RequestException, GofileError) as exc:
+        _print(f"Error: {exc}{NEW_LINE}", True)
+        return 1
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    exit(main())
 

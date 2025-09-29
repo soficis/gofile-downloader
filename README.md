@@ -1,144 +1,198 @@
 # gofile-downloader
 
-</br>
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-Download files from https://gofile.io
+A versatile command-line client for [gofile.io](https://gofile.io) that can mirror folders, resolve direct download links, and upload files using the public API.
 
----
+## Table of Contents
 
-#### Requirements
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Authentication](#authentication)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+- [Differences from Upstream](#differences-from-upstream-ltsdwgofile-downloader)
+- [Environment Variables](#environment-variables)
+- [Contributing](#contributing)
+- [License](#license)
 
-</br>
+## Features
 
-Python version 3.10 or newer.
+- **Mirror / Bulk Download**: High-performance, multi-threaded downloader for entire folders or batches of links (legacy behavior preserved).
+- **Single-File Download**: Quickly grab a specific file by content code or link, with optional password support and progress bars.
+- **Resolve Direct Links**: Convert any gofile folder link into direct file URLs (optionally as JSON).
+- **Upload**: Send files to gofile.io with optional descriptions, folder IDs, and progress bars.
+- **Token Helpers**: Automatically pick up your API token from `--token`, the `GOFILE_TOKEN` environment variable, or an `api.txt` file.
+- **Progress Indicators**: Real-time progress bars for downloads and uploads, showing percentage, transfer rate, and ETA.
 
----
+## Requirements
 
+- Python 3.10 or newer
+- Dependencies listed in `requirements.txt`
 
-#### Dependencies
+## Installation
 
-</br>
+1. Clone the repository:
 
-```cmd
-pip3 install -r requirements.txt
-```
----
+   ```bash
+   git clone https://github.com/soficis/gofile-downloader.git
+   cd gofile-downloader
+   ```
 
-#### Usage
+2. Install dependencies:
 
-</br>
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```
-python gofile-downloader.py https://gofile.io/d/contentid
-```
+## Authentication
 
-If it has password:
+To access private content or upload files, obtain an API token from your [gofile.io account](https://gofile.io/myProfile).
 
-```
-python gofile-downloader.py https://gofile.io/d/contentid password
-```
+The token is checked in this order:
 
-If you have a text file with multiple urls:
+1. `--token` command-line flag
+2. `GOFILE_TOKEN` environment variable
+3. First non-empty line in `api.txt` (next to the script or in the working directory)
 
-```
-https://gofile.io/d/contentid1
-https://gofile.io/d/contentid2
-https://gofile.io/d/contentid3
-https://gofile.io/d/contentid4
-```
+Example `api.txt`:
 
-```
-python gofile-downloader.py my-urls.txt
-```
-
-If you specify a password, this password will be used for ALL urls provided in the text file:
-
-```
-python gofile-downloader.py my-urls.txt password
-```
-
-It's possible to provide per link password, just don't pass the password altogether, provide the password in the text file separated by a space.
-
-```
-https://gofile.io/d/contentid1 password1
-https://gofile.io/d/contentid2
-https://gofile.io/d/contentid3
-https://gofile.io/d/contentid4 password4
+```text
+your_token_here
 ```
 
----
+## Quick Start
 
-#### Environment Variables
+### Download a Folder (Mirror)
 
-</br>
+```bash
+python gofile-downloader.py mirror https://gofile.io/d/CONTENT_ID
+```
 
-Use the environment variable **`GF_DOWNLOAD_DIR`** to specify where to download to (the
-path must exist already):
+### Resolve Direct Links
 
-| Shell | Command |
-|:---:| :---: |
-| **Windows Powershell** | `set GF_DOWNLOAD_DIR="C:\path\to\the\directory" && python gofile-downloader.py <url>` |
-| **Unix Shell** | `GF_DOWNLOAD_DIR="/path/to/the/directory" python gofile-downloader.py <url>`          |
+```bash
+python gofile-downloader.py resolve https://gofile.io/d/CONTENT_ID --json
+```
 
-</br>
+### Upload a File
 
-Use the environment variable **`GF_USERAGENT`** to specify browser user agent (defaults Mozilla/5.0):
+```bash
+python gofile-downloader.py upload ./myfile.zip --description "My upload"
+```
 
-| Platform | Command |
-| :---: | :---: |
-| **Windows Powershell** | `set GF_USERAGENT="user agent string" && python gofile-downloader.py <url>` |
-| **Unix Shell**         | `GF_USERAGENT="user agent string" python gofile-downloader.py <url>` |
+### Download a Single File
 
-</br>
+```bash
+python gofile-downloader.py download https://gofile.io/d/CONTENT_ID --dest ./downloads/
+```
 
-Use the environment variable **`GF_TOKEN`** to specify a specific account token:
+## Usage
 
-| Platform | Command |
-| :---: | :---: |
-| **Windows Powershell** | `set GF_TOKEN="account_token string" && python gofile-downloader.py <url>` |
-| **Unix Shell**         | `GF_TOKEN="account_token string" python gofile-downloader.py <url>` |
+Run `python gofile-downloader.py --help` for the full reference.
 
-</br>
+### Commands Overview
 
-Use the environment variable **`GF_INTERACTIVE`** to toggle manual file selection to download:
+| Command  | Purpose                                      | Example |
+|----------|----------------------------------------------|---------|
+| `mirror` | Multi-threaded folder mirroring (legacy)     | `python gofile-downloader.py mirror <url>` |
+| `download` | Single-file download with progress         | `python gofile-downloader.py download <url> --dest <dir>` |
+| `resolve` | Extract direct download URLs                | `python gofile-downloader.py resolve <url> --json` |
+| `upload` | Upload file to gofile.io with progress      | `python gofile-downloader.py upload <file> --description <desc>` |
 
-| Platform | Command |
-| :---: | :---: |
-| **Windows Powershell** | `set GF_INTERACTIVE="1" && python gofile-downloader.py <url>` |
-| **Unix Shell**         | `GF_INTERACTIVE="1" python gofile-downloader.py <url>` |
+### Detailed Usage
 
-</br>
+#### Mirror (Multi-threaded Downloader)
 
-Use the environment variable **`GF_MAX_CONCURRENT_DOWNLOADS`** to configure the maximum number of concurrent downloads:
+Downloads entire folders recursively, supporting passwords and batch files.
 
-| Platform | Command |
-| :---: | :---: |
-| **Windows Powershell** | `set GF_MAX_CONCURRENT_DOWNLOADS="5" && python gofile-downloader.py <url>` |
-| **Unix Shell**         | `GF_MAX_CONCURRENT_DOWNLOADS="5" python gofile-downloader.py <url>` |
+```bash
+python gofile-downloader.py mirror https://gofile.io/d/CONTENT_ID --password PASSWORD
+```
 
-</br>
+- Accepts a single link or a text file with one link per line.
+- Passwords can be global (`--password`) or per-line in the file (link + space + password).
+- Configurable via environment variables (see below).
 
-Use the environment variable **`GF_MAX_RETRIES`** to configure the number of retries on timeout:
+#### Download (Single File)
 
-| Platform | Command |
-| :---: | :---: |
-| **Windows Powershell** | `set GF_MAX_RETRIES="5" && python gofile-downloader.py <url>` |
-| **Unix Shell**         | `GF_MAX_RETRIES="5" python gofile-downloader.py <url>` |
+Fetches one file from a folder, with progress bar.
 
-</br>
+```bash
+python gofile-downloader.py download https://gofile.io/d/CONTENT_ID --dest ./downloads/ --file-id FILE_ID --overwrite
+```
 
-Use the environment variable **`GF_TIMEOUT`** to configure a timeout for connections:
+- `--file-id`: Specify which file if multiple exist.
+- `--dest`: Target directory or file path.
+- `--password`: For protected content.
+- `--overwrite`: Overwrite existing files.
 
-| Platform | Command |
-| :---: | :---: |
-| **Windows Powershell** | `set GF_TIMEOUT="15.0" && python gofile-downloader.py <url>` |
-| **Unix Shell**         | `GF_TIMEOUT="15.0" python gofile-downloader.py <url>` |
+#### Resolve (Direct Links)
 
-</br>
+Outputs direct URLs for all files in a folder.
 
-Use the environment variable **`GF_CHUNK_SIZE`** to configure the number of bytes read per chunk:
+```bash
+python gofile-downloader.py resolve https://gofile.io/d/CONTENT_ID --json --no-recursive
+```
 
-| Platform | Command |
-| :---: | :---: |
-| **Windows Powershell** | `set GF_CHUNK_SIZE="2097152" && python gofile-downloader.py <url>` |
-| **Unix Shell**         | `GF_CHUNK_SIZE="2097152" python gofile-downloader.py <url>` |
+- `--json`: Output as JSON array.
+- `--no-recursive`: Stop at the first folder level.
+- `--password`: For protected content.
+
+#### Upload
+
+Uploads a file to gofile.io, with progress bar.
+
+```bash
+python gofile-downloader.py upload ./file.pdf --folder-id FOLDER_ID --description "Description"
+```
+
+- `--folder-id`: Upload into a specific folder.
+- `--description`: Add a description to the file.
+
+### Legacy Usage
+
+The original single-command behavior is preserved:
+
+```bash
+python gofile-downloader.py https://gofile.io/d/CONTENT_ID [password]
+```
+
+This mirrors the folder as before.
+
+## Differences from Upstream (`ltsdw/gofile-downloader`)
+
+This fork enhances [ltsdw/gofile-downloader](https://github.com/ltsdw/gofile-downloader) with modern CLI ergonomics:
+
+- **Subcommand Structure**: Organized into `mirror`, `download`, `resolve`, and `upload` for clarity.
+- **Direct-Link Resolution**: Dedicated command for extracting URLs, unlike upstream's mirroring focus.
+- **Single-File Operations**: New download command with progress and overwrite handling.
+- **Upload Functionality**: Added file upload with progress, folder targeting, and descriptions.
+- **Token Management**: Streamlined token discovery from multiple sources.
+- **API Modernization**: Updated to use current gofile API endpoints (`/contents/{id}`) for reliability.
+- **Progress Bars**: Added real-time indicators for downloads and uploads.
+- **Documentation**: Comprehensive README with examples, tables, and comparisons.
+
+## Environment Variables
+
+These fine-tune the legacy `mirror` command:
+
+| Variable                  | Description                          | Windows Example                          | Unix Example                              |
+|---------------------------|--------------------------------------|------------------------------------------|------------------------------------------|
+| `GF_DOWNLOAD_DIR`        | Target directory (must exist)        | `set GF_DOWNLOAD_DIR="C:\path\to\dir"`   | `GF_DOWNLOAD_DIR="/path/to/dir"`         |
+| `GF_USERAGENT`           | Custom User-Agent                    | `set GF_USERAGENT="custom agent"`        | `GF_USERAGENT="custom agent"`            |
+| `GF_TOKEN`               | API token                            | `set GF_TOKEN="token"`                   | `GF_TOKEN="token"`                       |
+| `GF_INTERACTIVE`         | Enable file selection (`1` to enable)| `set GF_INTERACTIVE="1"`                 | `GF_INTERACTIVE="1"`                     |
+| `GF_MAX_CONCURRENT_DOWNLOADS` | Max parallel downloads          | `set GF_MAX_CONCURRENT_DOWNLOADS="5"`    | `GF_MAX_CONCURRENT_DOWNLOADS="5"`        |
+| `GF_MAX_RETRIES`         | Retry attempts on timeout           | `set GF_MAX_RETRIES="5"`                 | `GF_MAX_RETRIES="5"`                     |
+| `GF_TIMEOUT`             | Connection timeout (seconds)        | `set GF_TIMEOUT="15.0"`                  | `GF_TIMEOUT="15.0"`                      |
+| `GF_CHUNK_SIZE`          | Download chunk size (bytes)         | `set GF_CHUNK_SIZE="2097152"`            | `GF_CHUNK_SIZE="2097152"`                |
+
+## Contributing
+
+Contributions are welcome! Please open issues or pull requests on GitHub.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
