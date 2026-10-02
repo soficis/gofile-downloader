@@ -2,59 +2,42 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-A versatile command-line client for [gofile.io](https://gofile.io) that can mirror folders, resolve direct download links, and upload files using the public API.
+This fork is a multi-command gofile.io CLI: it keeps upstream-compatible folder mirroring, while adding focused single-file download, direct-link resolution, and upload commands with stronger download verification.
 
 ## Table of Contents
 
-- [Features](#features)
+- [Fork vs Upstream](#fork-vs-upstream)
+- [Authentication](#authentication)
 - [Requirements](#requirements)
 - [Installation](#installation)
-- [Authentication](#authentication)
 - [Quick Start](#quick-start)
-- [Usage](#usage)
-- [Differences from Upstream](#differences-from-upstream-ltsdwgofile-downloader)
+- [Modern Commands](#modern-commands)
+- [Legacy Compatibility](#legacy-compatibility)
 - [Environment Variables](#environment-variables)
 - [Contributing](#contributing)
 - [License](#license)
 
-## Features
+## Fork vs Upstream
 
-- **Mirror / Bulk Download**: High-performance, multi-threaded downloader for entire folders or batches of links (legacy behavior preserved).
-- **Single-File Download**: Quickly grab a specific file by content code or link, with optional password support and progress bars.
-- **Resolve Direct Links**: Convert any gofile folder link into direct file URLs (optionally as JSON).
-- **Upload**: Send files to gofile.io with optional descriptions, folder IDs, and progress bars.
-- **Token Helpers**: Automatically pick up your API token from `--token`, the `GOFILE_TOKEN` environment variable, or an `api.txt` file.
-- **Progress Indicators**: Real-time progress bars for downloads and uploads, showing percentage, transfer rate, and ETA.
-
-## Requirements
-
-- Python 3.10 or newer
-- Dependencies listed in `requirements.txt`
-
-## Installation
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/soficis/gofile-downloader.git
-   cd gofile-downloader
-   ```
-
-2. Install dependencies:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
+| Area | Upstream `ltsdw/gofile-downloader` | This fork |
+|---|---|---|
+| CLI shape | One positional mirroring command | `mirror`, `download`, `resolve`, and `upload` subcommands |
+| Single-file download | Not a separate workflow | Dedicated `download` command with `--file-id`, `--dest`, `--filename`, and `--overwrite` |
+| Direct links | Mirroring-oriented | Dedicated `resolve` command, including `--json` and `--no-recursive` |
+| Uploads | Not included | `upload` command with `--folder-id` and `--description` |
+| Token input | `GF_TOKEN` for the legacy path | Modern commands use `--token`, `GOFILE_TOKEN`, or `api.txt`; legacy `mirror` still uses `GF_TOKEN` |
+| Account bootstrap | Guest account flow in legacy path | Guest account bootstrap retained for both modern and legacy paths |
+| Download verification | Legacy resume-oriented behavior | Modern downloads check expected size and MD5 when available; failed partial files are removed |
+| Destination directories | Legacy `GF_DOWNLOAD_DIR` follows the upstream documented contract as a pre-existing directory | Modern `--dest` creates a missing directory; an existing file path is still written exactly |
+| Upload progress dependency | `requests` only | `requests` is enough for basic operation; `requests-toolbelt` adds streaming upload progress |
 
 ## Authentication
 
-To access private content or upload files, obtain an API token from your [gofile.io account](https://gofile.io/myProfile).
-
-The token is checked in this order:
+For modern commands, the token is checked in this order:
 
 1. `--token` command-line flag
 2. `GOFILE_TOKEN` environment variable
-3. First non-empty line in `api.txt` (next to the script or in the working directory)
+3. First non-empty line in `api.txt`, either beside the script or in the working directory
 
 Example `api.txt`:
 
@@ -62,132 +45,135 @@ Example `api.txt`:
 your_token_here
 ```
 
+If no token is supplied, the client still bootstraps a guest account automatically.
+
+Legacy `mirror` uses `GF_TOKEN` when present and otherwise follows the same guest-account bootstrap behavior.
+
+## Requirements
+
+- Python 3.10 or newer
+- `requests` for basic operation
+- `requests-toolbelt` only for streaming upload progress
+
+## Installation
+
+Minimal operation:
+
+```bash
+pip install requests
+```
+
+Full recommended installation, including upload progress support:
+
+```bash
+pip install -r requirements.txt
+```
+
+Clone the repository first if you are working from source:
+
+```bash
+git clone https://github.com/soficis/gofile-downloader.git
+cd gofile-downloader
+```
+
 ## Quick Start
-
-### Download a Folder (Mirror)
-
-```bash
-python gofile-downloader.py mirror https://gofile.io/d/CONTENT_ID
-```
-
-### Resolve Direct Links
-
-```bash
-python gofile-downloader.py resolve https://gofile.io/d/CONTENT_ID --json
-```
-
-### Upload a File
-
-```bash
-python gofile-downloader.py upload ./myfile.zip --description "My upload"
-```
-
-### Download a Single File
 
 ```bash
 python gofile-downloader.py download https://gofile.io/d/CONTENT_ID --dest ./downloads/
 ```
 
-## Usage
-
-Run `python gofile-downloader.py --help` for the full reference.
-
-### Commands Overview
-
-| Command  | Purpose                                      | Example |
-|----------|----------------------------------------------|---------|
-| `mirror` | Multi-threaded folder mirroring (legacy)     | `python gofile-downloader.py mirror <url>` |
-| `download` | Single-file download with progress         | `python gofile-downloader.py download <url> --dest <dir>` |
-| `resolve` | Extract direct download URLs                | `python gofile-downloader.py resolve <url> --json` |
-| `upload` | Upload file to gofile.io with progress      | `python gofile-downloader.py upload <file> --description <desc>` |
-
-### Detailed Usage
-
-#### Mirror (Multi-threaded Downloader)
-
-Downloads entire folders recursively, supporting passwords and batch files.
-
 ```bash
-python gofile-downloader.py mirror https://gofile.io/d/CONTENT_ID --password PASSWORD
+python gofile-downloader.py resolve https://gofile.io/d/CONTENT_ID --json
 ```
 
-- Accepts a single link or a text file with one link per line.
-- Passwords can be global (`--password`) or per-line in the file (link + space + password).
-- Configurable via environment variables (see below).
+```bash
+python gofile-downloader.py upload ./myfile.zip --description "My upload"
+```
 
-#### Download (Single File)
+```bash
+python gofile-downloader.py mirror https://gofile.io/d/CONTENT_ID
+```
 
-Fetches one file from a folder, with progress bar.
+Run `python gofile-downloader.py --help` for the complete CLI reference.
+
+## Modern Commands
+
+### Download
+
+Fetch one file with progress and verification.
 
 ```bash
 python gofile-downloader.py download https://gofile.io/d/CONTENT_ID --dest ./downloads/ --file-id FILE_ID --overwrite
 ```
 
-- `--file-id`: Specify which file if multiple exist.
-- `--dest`: Target directory or file path.
-- `--password`: For protected content.
-- `--overwrite`: Overwrite existing files.
+- `--file-id`: choose one file when the content contains several files.
+- `--dest`: destination directory, created when missing; an existing file path is written exactly.
+- `--filename`: output name inside the destination directory, overriding the server-provided name.
+- `--password`: password for protected content.
+- `--overwrite`: replace an existing destination file.
 
-#### Resolve (Direct Links)
+### Resolve
 
-Outputs direct URLs for all files in a folder.
+List direct file URLs contained in gofile content.
 
 ```bash
 python gofile-downloader.py resolve https://gofile.io/d/CONTENT_ID --json --no-recursive
 ```
 
-- `--json`: Output as JSON array.
-- `--no-recursive`: Stop at the first folder level.
-- `--password`: For protected content.
+- `--json`: emit the result as a JSON array.
+- `--no-recursive`: do not descend into nested folders.
+- `--password`: password for protected content.
 
-#### Upload
+### Upload
 
-Uploads a file to gofile.io, with progress bar.
+Send a file to gofile.io.
 
 ```bash
 python gofile-downloader.py upload ./file.pdf --folder-id FOLDER_ID --description "Description"
 ```
 
-- `--folder-id`: Upload into a specific folder.
-- `--description`: Add a description to the file.
+- `--folder-id`: upload into an existing folder.
+- `--description`: attach a description to the uploaded file.
+- Upload progress is streamed when `requests-toolbelt` is installed; otherwise upload uses a non-progress fallback.
 
-### Legacy Usage
+## Legacy Compatibility
 
-The original single-command behavior is preserved:
+The legacy multi-threaded mirroring engine is preserved for existing upstream-style workflows.
+
+Both of these use the legacy engine:
+
+```bash
+python gofile-downloader.py mirror https://gofile.io/d/CONTENT_ID --password PASSWORD
+```
 
 ```bash
 python gofile-downloader.py https://gofile.io/d/CONTENT_ID [password]
 ```
 
-This mirrors the folder as before.
+Legacy behavior notes:
 
-## Differences from Upstream (`ltsdw/gofile-downloader`)
-
-This fork enhances [ltsdw/gofile-downloader](https://github.com/ltsdw/gofile-downloader) with modern CLI ergonomics:
-
-- **Subcommand Structure**: Organized into `mirror`, `download`, `resolve`, and `upload` for clarity.
-- **Direct-Link Resolution**: Dedicated command for extracting URLs, unlike upstream's mirroring focus.
-- **Single-File Operations**: New download command with progress and overwrite handling.
-- **Upload Functionality**: Added file upload with progress, folder targeting, and descriptions.
-- **Token Management**: Streamlined token discovery from multiple sources.
-- **API Modernization**: Updated to use current gofile API endpoints (`/contents/{id}`) for reliability.
-- **Progress Bars**: Added real-time indicators for downloads and uploads.
-- **Documentation**: Comprehensive README with examples, tables, and comparisons.
+- Accepts either one link or a text file containing one link per line.
+- Batch text files may include per-line passwords after each link.
+- Interactive file selection is controlled with `GF_INTERACTIVE=1`.
+- Batch-file mirroring disables interactive selection.
+- Legacy downloads retain resume-oriented partial-file behavior.
 
 ## Environment Variables
 
-These fine-tune the legacy `mirror` command:
+These mainly tune legacy `mirror` behavior:
 
-| Variable                  | Description                          | Windows Example                          | Unix Example                              |
-|---------------------------|--------------------------------------|------------------------------------------|------------------------------------------|
-| `GF_DOWNLOAD_DIR`        | Target directory (must exist)        | `set GF_DOWNLOAD_DIR="C:\path\to\dir"`   | `GF_DOWNLOAD_DIR="/path/to/dir"`         |
-| `GF_USERAGENT`           | Custom User-Agent                    | `set GF_USERAGENT="custom agent"`        | `GF_USERAGENT="custom agent"`            |
-| `GF_TOKEN`               | API token                            | `set GF_TOKEN="token"`                   | `GF_TOKEN="token"`                       |
-| `GF_INTERACTIVE`         | Enable file selection (`1` to enable)| `set GF_INTERACTIVE="1"`                 | `GF_INTERACTIVE="1"`                     |
-| `GF_MAX_CONCURRENT_DOWNLOADS` | Max parallel downloads          | `set GF_MAX_CONCURRENT_DOWNLOADS="5"`    | `GF_MAX_CONCURRENT_DOWNLOADS="5"`        |
-| `GF_MAX_RETRIES`         | Retry attempts on timeout           | `set GF_MAX_RETRIES="5"`                 | `GF_MAX_RETRIES="5"`                     |
-| `GF_TIMEOUT`             | Connection timeout (seconds)        | `set GF_TIMEOUT="15.0"`                  | `GF_TIMEOUT="15.0"`                      |
-| `GF_CHUNK_SIZE`          | Download chunk size (bytes)         | `set GF_CHUNK_SIZE="2097152"`            | `GF_CHUNK_SIZE="2097152"`                |
+| Variable | Description | Windows Example | Unix Example |
+|---|---|---|---|
+| `GF_DOWNLOAD_DIR` | Legacy target directory; upstream documents it as pre-existing | `set GF_DOWNLOAD_DIR="C:\path\to\dir"` | `GF_DOWNLOAD_DIR="/path/to/dir"` |
+| `GF_USERAGENT` | Custom User-Agent | `set GF_USERAGENT="custom agent"` | `GF_USERAGENT="custom agent"` |
+| `GF_TOKEN` | Legacy API token | `set GF_TOKEN="token"` | `GF_TOKEN="token"` |
+| `GF_INTERACTIVE` | Enable legacy file selection (`1` enables it) | `set GF_INTERACTIVE="1"` | `GF_INTERACTIVE="1"` |
+| `GF_MAX_CONCURRENT_DOWNLOADS` | Maximum parallel legacy downloads | `set GF_MAX_CONCURRENT_DOWNLOADS="5"` | `GF_MAX_CONCURRENT_DOWNLOADS="5"` |
+| `GF_MAX_RETRIES` | Retry attempts after timeouts | `set GF_MAX_RETRIES="5"` | `GF_MAX_RETRIES="5"` |
+| `GF_TIMEOUT` | Connection timeout, in seconds | `set GF_TIMEOUT="15.0"` | `GF_TIMEOUT="15.0"` |
+| `GF_CHUNK_SIZE` | Legacy download chunk size, in bytes | `set GF_CHUNK_SIZE="2097152"` | `GF_CHUNK_SIZE="2097152"` |
+
+Modern `GofileClient` commands use `GOFILE_TOKEN`, not the `GF_*` legacy variables, except where explicitly documented.
 
 ## Contributing
 
