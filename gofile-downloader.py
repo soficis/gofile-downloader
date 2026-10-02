@@ -1,5 +1,5 @@
 #! /usr/bin/env python3
-
+# noqa: SIZE_OK - intentional single-file distributable: the documented install is "curl one file and run it", so a module split would break every existing copy.
 
 import argparse
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 from sys import argv, exit, stdout, stderr
 from typing import Any, Dict, Iterator, List, NoReturn, Optional, TextIO
 from types import FrameType
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, ParseResult
 from itertools import count
 from requests import Session, Response, Timeout, RequestException
 try:
@@ -19,26 +19,28 @@ except Exception:
 from requests.structures import CaseInsensitiveDict
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
-from hashlib import sha256
+from hashlib import md5, sha256
 from shutil import move
 from signal import signal, SIGINT, SIG_IGN
-from time import perf_counter
+from time import perf_counter, time
 from math import ceil
 
 
 NEW_LINE: str = "\n" if name != "nt" else "\r\n"
 API_BASE: str = "https://api.gofile.io"
 TOKEN_FILENAME: str = "api.txt"
+# WEB_LOCALE is folded into both the X-BL header and the website-token salt; changing one without the other silently breaks auth.
+WEB_LOCALE: str = "en-US"
+WEBSITE_TOKEN_SALT: str = "12af056dacea0b"
+# The website token is derived from the User-Agent actually sent, so the API rejects a default that looks like tooling.
+DEFAULT_USER_AGENT: str = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def has_ansi_support() -> bool:
-    """
-    has_ansi_support
-
-    Checks whether the platform support ansi or not.
-
-    :return: True if the platform supports it.
-    """
+    """Return True when the terminal is able to render ANSI escapes."""
 
     import os
     import sys
@@ -50,7 +52,6 @@ def has_ansi_support() -> bool:
         # Not sure, but I think the console on win10+ have default ansi support
         return sys.getwindowsversion().major >= 10
 
-    # I hope the rest supports it??
     return True
 
 
@@ -60,15 +61,7 @@ TERMINAL_CLEAR_LINE: str = f"\r{' ' * 100} \r" if not has_ansi_support() else "\
 
 
 def _print(msg: str, error: bool = False) -> None:
-    """
-    _print
-
-    Print a message.
-
-    :param msg: a string to be printed.
-    :param error: if the error stream output should be used instead of the standard output.
-    :return:
-    """
+    """Write msg to stdout, or to stderr when error is set."""
 
     output: TextIO = stderr if error else stdout
     output.write(msg)
@@ -111,17 +104,22 @@ def _print_progress(prefix: str, transferred: int, total: Optional[int], start_t
 
 
 def die(msg: str) -> NoReturn:
-    """
-    die
-
-    Display a message of error and exit.
-
-    :param msg: a string to be printed.
-    :return:
-    """
+    """Print msg to stderr and exit with a non-zero status."""
 
     _print(f"{msg}{NEW_LINE}", True)
     exit(-1)
+
+
+def generate_website_token(user_agent: str, account_token: str) -> str:
+    """Compute the X-Website-Token the web app sends.
+
+    It is bound to the User-Agent actually transmitted and rotates every four hours,
+    so a token minted for a different agent or slot is rejected as error-token.
+    """
+
+    time_slot = int(time()) // 14400
+    raw = f"{user_agent}::{WEB_LOCALE}::{account_token}::{time_slot}::{WEBSITE_TOKEN_SALT}"
+    return sha256(raw.encode()).hexdigest()
 
 
 class GofileError(RuntimeError):
@@ -136,7 +134,9 @@ class GofileClient:
             "Accept": "application/json",
             "Accept-Encoding": "gzip, deflate",
             "Connection": "keep-alive",
-            "User-Agent": "gofile-downloader/2.x",
+            "Origin": "https://gofile.io",
+            "Referer": "https://gofile.io/",
+            "User-Agent": DEFAULT_USER_AGENT,
         }
     )
 
@@ -145,6 +145,33 @@ class GofileClient:
         self.session.headers.update(self._DEFAULT_HEADERS)
         self.token: Optional[str] = token or getenv("GOFILE_TOKEN") or load_token_from_file()
         self._attach_token(self.token)
+
+    @property
+    def user_agent(self) -> str:
+        """The User-Agent actually set on the session, which the website token is bound to."""
+
+        return self.session.headers.get("User-Agent", DEFAULT_USER_AGENT)
+
+    def _website_headers(self, account_token: Optional[str] = None) -> Dict[str, str]:
+        return {
+            "X-Website-Token": generate_website_token(self.user_agent, account_token or ""),
+            "X-BL": WEB_LOCALE,
+        }
+
+    def ensure_account(self) -> str:
+        """Create a guest account so authenticated-only endpoints stop returning error-token."""
+
+        if self.token:
+            return self.token
+        response = self.session.post(
+            f"{API_BASE}/accounts",
+            headers=self._website_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        self.token = self._ensure_ok(response.json())["token"]
+        self._attach_token(self.token)
+        return self.token
 
     def _attach_token(self, token: Optional[str]) -> None:
         if not token:
@@ -159,15 +186,9 @@ class GofileClient:
         return payload["data"]
 
     def get_server(self) -> str:
-        # Note: getServer endpoint may be unavailable; fallback to known server
-        try:
-            response = self.session.get(f"{API_BASE}/getServer", timeout=30)
-            response.raise_for_status()
-            data = self._ensure_ok(response.json())
-            return data["server"]
-        except Exception:
-            # Fallback to a known working server
-            return "store1"
+        response = self.session.get(f"{API_BASE}/getServer", timeout=30)
+        response.raise_for_status()
+        return self._ensure_ok(response.json())["server"]
 
     def upload(
         self,
@@ -211,21 +232,23 @@ class GofileClient:
         return self._ensure_ok(response.json())
 
     def get_content(self, content_id: str, password: Optional[str] = None) -> Dict[str, Any]:
+        account_token = self.ensure_account()
         url = f"{API_BASE}/contents/{content_id}"
         params: Dict[str, Any] = {
-            "wt": "4fd6sg89d7s6",
             "cache": "true",
             "sortField": "createTime",
             "sortDirection": "1",
         }
         if password:
-            params["password"] = password
-        response = self.session.get(url, params=params, timeout=30)
+            params["password"] = sha256(password.encode()).hexdigest()
+        response = self.session.get(
+            url,
+            params=params,
+            headers=self._website_headers(account_token),
+            timeout=30,
+        )
         response.raise_for_status()
-        data = response.json()
-        if data.get("status") != "ok":
-            raise GofileError(data.get("status", "error"))
-        return data["data"]
+        return self._ensure_ok(response.json())
 
     @staticmethod
     def _extract_child_id(entry: Dict[str, Any]) -> Optional[str]:
@@ -249,6 +272,7 @@ class GofileClient:
             "fileId": file_id,
             "name": name,
             "size": entry.get("size"),
+            "md5": entry.get("md5"),
             "directLink": direct_link,
             "parentContentId": parent_id,
         }
@@ -315,6 +339,7 @@ class GofileClient:
         file_id: Optional[str] = None,
         password: Optional[str] = None,
         overwrite: bool = False,
+        filename: Optional[str] = None,
     ) -> Path:
         payload = self.get_content(content_id=content_id, password=password)
         parent_reference = payload.get("id") or content_id
@@ -339,43 +364,81 @@ class GofileClient:
                 )
             selected = files[0]
 
-        if not selected:
-            raise GofileError("Unable to determine download target")
-
         direct_link = selected.get("directLink")
         if not direct_link:
             raise GofileError("Direct download link missing in response")
 
-        filename = selected.get("name") or selected.get("fileId") or f"{content_id}.bin"
+        server_filename = selected.get("name") or selected.get("fileId") or f"{content_id}.bin"
 
-        if destination.is_dir():
-            target = destination / filename
+        # A missing destination is a directory to create: argparse strips trailing
+        # slashes, so no heuristic can tell "out" the file from "out" the folder.
+        # Only an existing file keeps the write-to-this-exact-path behaviour.
+        if filename:
+            directory = (
+                destination
+                if destination.is_dir() or not destination.exists()
+                else destination.parent
+            )
+            target = directory / filename
+        elif destination.is_dir() or not destination.exists():
+            target = destination / server_filename
         else:
             target = destination
 
         if target.exists() and not overwrite:
             raise FileExistsError(f"Destination '{target}' already exists")
 
-        with self.session.get(direct_link, stream=True, timeout=120) as response:
-            response.raise_for_status()
-            total_size = None
-            try:
-                total_size = int(response.headers.get("Content-Length") or 0) or None
-            except (TypeError, ValueError):
-                total_size = None
+        expected_size = selected.get("size")
+        expected_md5 = selected.get("md5")
+        # gofile.io answers an unauthenticated fetch with HTTP 200 and a short HTML
+        # body, so the status code alone cannot prove the payload arrived intact.
+        partial = target.with_name(target.name + ".part")
+        partial.parent.mkdir(parents=True, exist_ok=True)
 
-            target.parent.mkdir(parents=True, exist_ok=True)
-            transferred = 0
-            start = perf_counter()
-            with target.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        fh.write(chunk)
-                        transferred += len(chunk)
-                        _print_progress(f"Downloading {filename}", transferred, total_size, start)
-            # newline after finished
+        try:
+            with self.session.get(direct_link, stream=True, timeout=120) as response:
+                response.raise_for_status()
+                try:
+                    total_size = int(response.headers.get("Content-Length") or 0) or None
+                except (TypeError, ValueError):
+                    total_size = None
+
+                transferred = 0
+                start = perf_counter()
+                digest = md5()
+                with partial.open("wb") as fh:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            fh.write(chunk)
+                            digest.update(chunk)
+                            transferred += len(chunk)
+                            _print_progress(f"Downloading {target.name}", transferred, total_size, start)
             _print("\n")
+
+            self._verify_payload(partial, transferred, expected_size, expected_md5, digest.hexdigest())
+            partial.replace(target)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
         return target
+
+    @staticmethod
+    def _verify_payload(
+        partial: Path,
+        transferred: int,
+        expected_size: Optional[int],
+        expected_md5: Optional[str],
+        actual_md5: str,
+    ) -> None:
+        if isinstance(expected_size, int) and transferred != expected_size:
+            raise GofileError(
+                f"Incomplete download for '{partial.name}': got {transferred} bytes, "
+                f"expected {expected_size}"
+            )
+        if expected_md5 and actual_md5.lower() != str(expected_md5).lower():
+            raise GofileError(
+                f"Checksum mismatch for '{partial.name}': got {actual_md5}, expected {expected_md5}"
+            )
 
 
 def extract_content_id(value: str) -> str:
@@ -392,8 +455,7 @@ def extract_content_id(value: str) -> str:
     if path_parts:
         if path_parts[0].lower() == "d" and len(path_parts) >= 2:
             return path_parts[1]
-        if path_parts[-1]:
-            return path_parts[-1]
+        return path_parts[-1]
 
     query = parse_qs(parsed.query)
     for key in ("c", "contentId", "contentid", "id"):
@@ -425,8 +487,6 @@ def load_token_from_file() -> Optional[str]:
         seen.add(candidate)
         try:
             content = candidate.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            continue
         except OSError:
             continue
 
@@ -452,8 +512,6 @@ class Downloader:
         password: str | None = None,
     ) -> None:
         """
-        Downloader
-
         Downloader class to concurrently manage, download and write files to disk.
         This one does the heavy lifting, the actual working of downloading.
 
@@ -511,7 +569,6 @@ class Downloader:
         content_dir: str = path.join(self._root_dir, content_id)
         self._build_content_tree_structure(content_dir, content_id, _password)
 
-        # removes the root content directory if there's no file or subdirectory
         if path.exists(content_dir) and not listdir(content_dir) and not self._files_info:
             _print(f"Empty directory for url: {self._url}, nothing done.{NEW_LINE}")
             self._remove_dir(content_dir)
@@ -525,8 +582,6 @@ class Downloader:
 
     def _get_response(self, **kwargs: Any) -> Response | None:
         """
-        _get_response
-
         Auxiliary function for the requests.session.get.
 
         :param kwargs: arguments for the requests.session.get function.
@@ -541,31 +596,31 @@ class Downloader:
 
 
     def _threaded_downloads(self) -> None:
-        """
-        _threaded_downloads
-
-        Parallelize the downloads.
-
-        :return:
-        """
+        """Parallelize the downloads."""
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
-            for item in self._files_info.values():
-                if self._stop_event.is_set():
-                    return
-
+            futures = [
                 executor.submit(self._download_content, item)
+                for item in self._files_info.values()
+                if not self._stop_event.is_set()
+            ]
+
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as error:
+                    _print(
+                        f"{TERMINAL_CLEAR_LINE}"
+                        f"Failed to download a file: {error}{NEW_LINE}"
+                    )
 
 
     @staticmethod
     def _create_dirs(dirname: str) -> None:
         """
-        _create_dirs
-
         Creates a directory and its subdirectories recursively if they don't exist.
 
         :param dirname: name of the directory to be created.
-        :return:
         """
 
         makedirs(dirname, exist_ok = True)
@@ -574,28 +629,22 @@ class Downloader:
     @staticmethod
     def _remove_dir(dirname: str) -> None:
         """
-        _remove_dir
-
         Removes a directory if it's empty ignoring any throw.
 
-        :param dirname: name of the directory to be created.
-        :return:
+        :param dirname: name of the directory to be removed.
         """
 
         try:
             rmdir(dirname)
-        except:
+        except OSError:
             pass
 
 
     def _download_content(self, file_info: dict[str, str]) -> None:
         """
-        _download_content
-
         Requests the contents of the file and writes it.
 
         :param file_info: a dictionary with information about a file to be downloaded.
-        :return:
         """
 
         filepath: str = path.join(file_info["path"], file_info["filename"])
@@ -606,16 +655,12 @@ class Downloader:
         tmp_file: str =  f"{filepath}.part"
         url: str = file_info["link"]
 
-        headers: dict[str, str] = {}
-        if path.isfile(tmp_file):
-            part_size = int(path.getsize(tmp_file))
-            headers = {"Range": f"bytes={part_size}-"}
-
         for _ in range(self._number_retries):
             try:
                 part_size: int = 0
+                headers: dict[str, str] = {}
                 if path.isfile(tmp_file):
-                    part_size = int(path.getsize(tmp_file))
+                    part_size = path.getsize(tmp_file)
                     headers = {"Range": f"bytes={part_size}-"}
 
                 has_size: str | None = self._perform_download(
@@ -659,8 +704,6 @@ class Downloader:
         part_size: int,
     ) -> str | None:
         """
-        _perform_download
-
         Executes the HTTP GET request, processes file chunks, and tracks progress.
 
         :param file_info: a dictionary containing file details.
@@ -685,8 +728,7 @@ class Downloader:
         with response:
             status_code: int = response.status_code
 
-            if not self._is_valid_response(response.status_code, part_size):
-                _print(str(self._session.headers))
+            if not self._is_valid_response(status_code, part_size):
                 _print(
                     f"{TERMINAL_CLEAR_LINE}"
                     f"Couldn't download the file from {url}.{NEW_LINE}"
@@ -718,8 +760,6 @@ class Downloader:
     @staticmethod
     def _is_valid_response(status_code: int, part_size: int) -> bool:
         """
-        _is_valid_response
-
         Validates HTTP status code based on partial download state.
 
         :param status_code: the HTTP status code.
@@ -739,8 +779,6 @@ class Downloader:
     @staticmethod
     def _extract_file_size(headers: CaseInsensitiveDict[str], part_size: int) -> str | None:
         """
-        _extract_file_size
-
         Retrieves the file size from HTTP headers.
 
         :param headers: the HTTP response headers.
@@ -748,15 +786,19 @@ class Downloader:
         :return: the total file size as a string, or None if unavailable.
         """
 
-        content_length: str | None = headers.get("Content-Length")
-        content_range: str | None = headers.get("Content-Range")
-        has_size: str | None = (
-            content_length if part_size == 0
-            else content_range.split("/")[-1] if content_range
-            else None
-        )
+        if part_size == 0:
+            return headers.get("Content-Length")
 
-        return has_size
+        content_range: str | None = headers.get("Content-Range")
+
+        if not content_range:
+            return None
+
+        total: str = content_range.split("/")[-1]
+
+        # "*" is the legal HTTP marker for an unknown total. It must read as
+        # unavailable rather than as a size, or the caller's float() raises.
+        return None if total == "*" else total
 
 
     def _write_chunks(
@@ -768,8 +810,6 @@ class Downloader:
         filename: str
     ) -> None:
         """
-        _write_chunks
-
         Iterates over download chunks and writes them to disk, updating progress.
 
         :param chunks: a generator of byte chunks.
@@ -777,47 +817,46 @@ class Downloader:
         :param part_size: number of bytes already downloaded.
         :param total_size: total file size in bytes.
         :param filename: the file's name.
-        :return:
         """
 
         start_time: float = perf_counter()
+        written: int = 0
 
         with open(tmp_file, "ab") as f:
-            for i, chunk in enumerate(chunks):
+            for chunk in chunks:
                 if self._stop_event.is_set():
                     return
 
                 f.write(chunk)
-                self._update_progress(filename, part_size, i, chunk, total_size, start_time)
+                written += len(chunk)
+                self._update_progress(filename, part_size + written, total_size, start_time)
 
 
     def _update_progress(
         self,
         filename: str,
-        part_size: int,
-        i: int,
-        chunk: bytes,
-        total_size: float,
+        transferred: int,
+        total_size: float | None,
         start_time: float
     ) -> None:
         """
-        _update_progress
-
         Calculates and displays download progress and transfer rate.
 
         :param filename: the name of the file being downloaded.
-        :param part_size: initial file size in bytes.
-        :param i: current iteration number.
-        :param chunk: the downloaded byte chunk.
-        :param total_size: total file size.
+        :param transferred: bytes on disk for this file, including any resumed prefix.
+        :param total_size: total file size, or None when the server did not say.
         :param start_time: download start time.
-        :return:
         """
 
-        progress: float = (part_size + (i * len(chunk))) / total_size * 100
-        rate: float = (i * len(chunk)) / (perf_counter() - start_time)
+        elapsed: float = max(perf_counter() - start_time, 1e-9)
 
-        unit: str = "B/s"
+        if total_size is None:
+            return
+
+        progress: float = min(transferred / total_size * 100, 100.0) if total_size else 0.0
+        rate: float = transferred / elapsed
+
+        unit: str
         if rate < 1024:
             unit = "B/s"
         elif rate < (1024 ** 2):
@@ -832,7 +871,7 @@ class Downloader:
 
         _print(
             f"{TERMINAL_CLEAR_LINE}"
-            f"Downloading {filename}: {part_size + i * len(chunk)} "
+            f"Downloading {filename}: {transferred} "
             f"of {int(total_size)} {round(progress, 1)}% {round(rate, 1)}{unit}"
         )
 
@@ -840,20 +879,18 @@ class Downloader:
     @staticmethod
     def _finalize_download(file_info: dict[str, str], tmp_file: str, has_size: str) -> None:
         """
-        _finalize_download
-
         Verifies the final file size and moves the temporary file to its destination.
 
         :param file_info: a dictionary containing file details.
         :param tmp_file: temporary file path.
         :param has_size: expected file size.
-        :return:
         """
 
-        if path.getsize(tmp_file) == int(has_size):
+        final_size = path.getsize(tmp_file)
+        if final_size == int(has_size):
             _print(
                 f"{TERMINAL_CLEAR_LINE}"
-                f"Downloading {file_info['filename']}: {path.getsize(tmp_file)} "
+                f"Downloading {file_info['filename']}: {final_size} "
                 f"of {has_size} Done!{NEW_LINE}"
             )
             move(tmp_file, path.join(file_info["path"], file_info["filename"]))
@@ -861,8 +898,6 @@ class Downloader:
 
     def _register_file(self, file_index: count, filepath: str, file_url: str) -> None:
         """
-        _register_file
-
         Registers file information into the internal files info dictionary
         (with sequential index, path, filename and download url).
 
@@ -889,8 +924,6 @@ class Downloader:
         is_dir: bool = False,
     ) -> str:
         """
-        _resolve_naming_collision
-
         Ensures unique file or directory paths by checking and updating a naming collision
         tracker. If a collision is detected, appends a numeric suffix to the name to
         avoid overwriting existing paths.
@@ -911,10 +944,10 @@ class Downloader:
         else:
             pathing_count[filepath] = 0
 
-        if pathing_count and pathing_count[filepath] > 0 and is_dir:
+        if pathing_count[filepath] > 0 and is_dir:
             return f"{filepath}({pathing_count[filepath]})"
 
-        if pathing_count and pathing_count[filepath] > 0:
+        if pathing_count[filepath] > 0:
             extension: str
             root, extension = path.splitext(filepath)
 
@@ -922,6 +955,23 @@ class Downloader:
 
         return filepath
 
+
+    def _website_headers(self) -> dict[str, str]:
+        """
+        Build the X-Website-Token headers from the session's own User-Agent and the
+        account token, mirroring what the web app computes client-side.
+
+        :return: header mapping to merge into the /contents request.
+        """
+
+        user_agent = self._session.headers.get("User-Agent", DEFAULT_USER_AGENT)
+        auth = self._session.headers.get("Authorization", "")
+        account_token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+
+        return {
+            "X-Website-Token": generate_website_token(user_agent, account_token),
+            "X-BL": WEB_LOCALE,
+        }
 
     def _build_content_tree_structure(
         self,
@@ -932,8 +982,6 @@ class Downloader:
         file_index: count = count(start=0, step=1)
     ) -> None:
         """
-        _build_content_tree_structure
-
         Recursively traverses a remote content structure and builds a corresponding
         local directory tree (handling naming collisions), while registering files url.
 
@@ -949,7 +997,7 @@ class Downloader:
         :return:
         """
 
-        url: str = f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6&cache=true&sortField=createTime&sortDirection=1"
+        url: str = f"{API_BASE}/contents/{content_id}?cache=true&sortField=createTime&sortDirection=1"
 
         if not pathing_count:
             pathing_count = {}
@@ -957,8 +1005,8 @@ class Downloader:
         if password:
             url = f"{url}&password={password}"
 
-        response: Response | None = self._get_response(url=url)
-        json_response: dict[str, Any] = {} if not response else response.json()
+        response: Response | None = self._get_response(url=url, headers=self._website_headers())
+        json_response: dict[str, Any] = response.json() if response else {}
 
         if not json_response or json_response["status"] != "ok":
             _print(f"Failed to fetch data response from the {url}.{NEW_LINE}")
@@ -971,13 +1019,12 @@ class Downloader:
             return
 
         if data["type"] != "folder":
+            self._create_dirs(parent_dir)
             filepath: str = self._resolve_naming_collision(pathing_count, parent_dir, data["name"])
-
             self._register_file(file_index, filepath, data["link"])
             return
 
-        folder_name: str = data["name"]
-        absolute_path: str = self._resolve_naming_collision(pathing_count, parent_dir, folder_name)
+        absolute_path: str = self._resolve_naming_collision(pathing_count, parent_dir, data["name"])
 
         # If the content directory (the root directory) directory isn't named the same as the content_id,
         # use the content_id as a name for the content directory.
@@ -988,36 +1035,27 @@ class Downloader:
 
         self._create_dirs(absolute_path)
 
-        # Checks if there is any children (files and directories) and handle them
         for child in data["children"].values():
             if child["type"] == "folder":
                 self._build_content_tree_structure(absolute_path, child["id"], password, pathing_count, file_index)
             else:
                 filepath: str = self._resolve_naming_collision(pathing_count, absolute_path, child["name"])
-
                 self._register_file(file_index, filepath, child["link"])
 
 
     def _print_list_files(self) -> None:
-        """
-        _print_list_files
-
-        Helper function to display a list of all files for selection.
-
-        :return:
-        """
+        """Helper function to display a list of all files for selection."""
 
         MAX_FILENAME_CHARACTERS: int = 100
-        width: int = max(len(f"[{v}] -> ") for v in self._files_info.keys())
+        width: int = max(len(f"[{v}] -> ") for v in self._files_info)
 
         for (k, v) in self._files_info.items():
-            # Trim the filepath if it's too long
             filepath: str = path.join(v["path"], v["filename"])
             filepath = f"...{filepath[-MAX_FILENAME_CHARACTERS:]}" \
                 if len(filepath) > MAX_FILENAME_CHARACTERS \
                 else filepath
 
-            text: str =  f"{f'[{k}] -> '.ljust(width)}{filepath}"
+            text: str = f"[{k}] -> ".ljust(width) + filepath
 
             _print(f"{text}{NEW_LINE}"
                    f"{'-' * len(text)}"
@@ -1027,12 +1065,9 @@ class Downloader:
 
     def _do_interactive(self, content_dir: str) -> None:
         """
-        _do_interactive
-
         Performs interactive file selection for download.
 
         :param content_dir: Content root directory.
-        :return:
         """
 
         self._print_list_files()
@@ -1043,38 +1078,32 @@ class Downloader:
             f"{NEW_LINE}"
             f":: "
         ).split())
-        input_list = set(self._files_info.keys()) if not input_list \
-                     else input_list & set(self._files_info.keys())
+        valid_indexes = set(self._files_info)
+        input_list = valid_indexes if not input_list \
+                     else input_list & valid_indexes
 
         if not input_list:
             _print(f"Nothing done.{NEW_LINE}")
+            self._files_info.clear()
             self._remove_dir(content_dir)
             return
 
-        keys_to_delete: list[str] = list(set(self._files_info.keys()) - set(input_list))
-
-        for key in keys_to_delete:
+        for key in valid_indexes - input_list:
             del self._files_info[key]
-
 
 
 class Manager:
     def __init__(self, url_or_file: str, password: str | None = None) -> None:
         """
-        Manager
-
         Manager class to handle individual download tasks.
 
         :url_or_file: This may be an existent text file or url.
         :password: Password if the content is protected.
-        :return:
         """
 
         root_dir: str | None = getenv("GF_DOWNLOAD_DIR")
 
-        # Defaults to 5 concurrent downloads
         self._max_workers: int = int(getenv("GF_MAX_CONCURRENT_DOWNLOADS", 5))
-        # Defaults to 5 retries
         self._number_retries: int = int(getenv("GF_MAX_RETRIES", 5))
         # Connection and read timeout, defaults to 15 seconds
         self._timeout: float = float(getenv("GF_TIMEOUT", 15.0))
@@ -1092,22 +1121,53 @@ class Manager:
 
         self._session.headers.update({
             "Accept-Encoding": "gzip",
-            "User-Agent": self._user_agent if self._user_agent else "Mozilla/5.0",
+            "User-Agent": self._user_agent if self._user_agent else DEFAULT_USER_AGENT,
             "Connection": "keep-alive",
             "Accept": "*/*",
+            "Origin": "https://gofile.io",
+            "Referer": "https://gofile.io/",
         })
+
+
+    @staticmethod
+    def _normalize_http_url(value: str) -> Optional[str]:
+        """
+        Normalize value as an url if it's a possible url-like string, otherwise returning None.
+
+        :value: possible url-like string.
+        :return: a normalized url or None if it can't be normalized as one.
+        """
+
+        value = value.strip()
+        parsed: ParseResult = urlparse(value)
+
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return value
+
+        if not parsed.scheme and "." in parsed.path:
+            candidate: str = f"https://{value}"
+            parsed = urlparse(candidate)
+
+            if parsed.netloc:
+                return candidate
+
+        return None
 
 
     def _parse_url_or_file(self) -> None:
         """
-        _parse_url_or_file
-
         Parses a file or a url for possible links.
-
-        :return:
         """
 
-        if not (path.exists(self._url_or_file) and path.isfile(self._url_or_file)):
+        source: str = self._url_or_file.strip()
+        filepath: Path = Path(source).expanduser()
+        url: Optional[str] = self._normalize_http_url(source)
+        is_link_file: bool = filepath.is_file()
+
+        if not is_link_file and not url:
+            die(f"{source} is either a valid url or local url file.")
+
+        if not is_link_file and url:
             downloader: Downloader = Downloader(
                 self._root_dir,
                 self._interactive,
@@ -1117,7 +1177,7 @@ class Manager:
                 self._chunk_size,
                 self._stop_event,
                 self._session,
-                self._url_or_file,
+                url,
                 self._password
             )
 
@@ -1125,7 +1185,7 @@ class Manager:
 
             return
 
-        with open(self._url_or_file, "r") as f:
+        with open(filepath, "r") as f:
             lines: list[str] = f.readlines()
 
         # I think it's better to limit this one here, the api may get angry if we starve it.
@@ -1138,9 +1198,20 @@ class Manager:
                     return
 
                 line_splitted: list[str] = line.split(" ")
-                url: str = line_splitted[0].strip()
-                password: str | None = self._password if self._password else line_splitted[1].strip() \
-                    if len(line_splitted) > 1 else self._password
+                source = line_splitted[0].strip()
+                url = self._normalize_http_url(source)
+
+                if not url:
+                    _print(f"{source} is not a valid url.")
+                    continue
+
+                if self._password:
+                    password: str | None = self._password
+                elif len(line_splitted) > 1:
+                    password = line_splitted[1].strip()
+                else:
+                    password = self._password
+
                 downloader: Downloader = Downloader(
                     self._root_dir,
                     False, # Disable interactive download when downloading a batch from text file.
@@ -1159,11 +1230,7 @@ class Manager:
 
     def run(self) -> None:
         """
-        run
-
         This method starts the download process after the creation of the Downloader object.
-
-        :return:
         """
 
         signal(SIGINT, self._handle_sigint)
@@ -1174,25 +1241,28 @@ class Manager:
 
     def _set_account_access_token(self, token: str | None = None) -> None:
         """
-        _set_account_access_token
-
         Get a new access token for the account created or use the token provided for an already existent account.
 
         :param token: token to be used accross connections if available.
-        :return:
         """
 
         if token:
-            self._session.cookies.set("Cookie", f"accountToken={token}")
+            self._session.cookies.set("accountToken", token)
             self._session.headers.update({"Authorization": f"Bearer {token}"})
             return
 
         response: dict[Any, Any] = {}
+        user_agent = self._session.headers.get("User-Agent", DEFAULT_USER_AGENT)
+        auth_headers = {
+            "X-Website-Token": generate_website_token(user_agent, ""),
+            "X-BL": WEB_LOCALE,
+        }
 
         for _ in range(self._number_retries):
             try:
                 response = self._session.post(
-                    "https://api.gofile.io/accounts",
+                    f"{API_BASE}/accounts",
+                    headers=auth_headers,
                     timeout=self._timeout
                 ).json()
             except Timeout:
@@ -1200,20 +1270,16 @@ class Manager:
             else:
                 break
 
-        if not response and response["status"] != "ok":
+        if not response or response.get("status") != "ok":
             die("Account creation failed!")
 
-        self._session.cookies.set("Cookie", f"accountToken={response['data']['token']}")
+        self._session.cookies.set("accountToken", response['data']['token'])
         self._session.headers.update({"Authorization": f"Bearer {response['data']['token']}"})
 
 
     def _stop(self) -> None:
         """
-        _stop
-
         Stops all work from continuing.
-
-        :return:
         """
 
         _print(f"{TERMINAL_CLEAR_LINE}Stopping, please wait...{NEW_LINE}")
@@ -1222,8 +1288,6 @@ class Manager:
 
     def _handle_sigint(self, _: int, __: FrameType | None) -> None:
         """
-        _handle_sigint
-
         Signal handler triggered when a SIGINT (when pressing CTRL-C) is received.
         Issues the stop event so that the running tasks can close gracefully,
         ignoring tasks that didn't start yet.
@@ -1231,7 +1295,6 @@ class Manager:
         :param signum:  Signal number received (for this callback usually SIGINT).
         :param frame:   FrameType object representing the current stack frame
                         where the received signal was caught.
-        :return:
         """
 
         if not self._stop_event.is_set():
@@ -1291,7 +1354,11 @@ def parse_cli_args(args: Optional[List[str]] = None) -> tuple[argparse.ArgumentP
         "--dest",
         type=Path,
         default=Path.cwd(),
-        help="Destination file or directory",
+        help="Destination directory (created when missing), or an existing file path",
+    )
+    download_parser.add_argument(
+        "--filename",
+        help="Output file name inside the destination directory (overrides the server name)",
     )
     download_parser.add_argument(
         "--password",
@@ -1327,6 +1394,13 @@ def parse_cli_args(args: Optional[List[str]] = None) -> tuple[argparse.ArgumentP
     )
     resolve_parser.set_defaults(recursive=True)
 
+    for subparser in (mirror_parser, upload_parser, download_parser, resolve_parser):
+        subparser.add_argument(
+            "--token",
+            default=argparse.SUPPRESS,
+            help="Gofile API token (overrides the global --token)",
+        )
+
     return parser, parser.parse_args(args)
 
 
@@ -1356,7 +1430,7 @@ def main(argv_: Optional[List[str]] = None) -> int:
 
     parser, args = parse_cli_args(argv_)
 
-    if not getattr(args, "command", None):
+    if not args.command:
         parser.print_help()
         return 1
 
@@ -1390,6 +1464,7 @@ def main(argv_: Optional[List[str]] = None) -> int:
                 file_id=args.file_id,
                 password=args.password,
                 overwrite=args.overwrite,
+                filename=args.filename,
             )
             _print(f"Downloaded to {destination}{NEW_LINE}")
             return 0
